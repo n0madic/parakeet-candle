@@ -6,6 +6,30 @@ pub trait CacheLike {
     fn update_and_fetch_conv(&mut self, x: &Tensor, padding: usize) -> Result<Tensor>;
 }
 
+/// Builds the depthwise-conv input for one streamed chunk and the history for
+/// the next one.
+///
+/// The input is `padding` frames of history (zeros before the first chunk),
+/// then `x`, then `padding` zeros, matching the symmetric padding of the
+/// non-streaming path. The returned history is the `padding` frames that end
+/// at `committed`: the next chunk starts there, because frames after it are
+/// re-encoded.
+fn conv_input_and_history(
+    history: Option<&Tensor>,
+    x: &Tensor,
+    padding: usize,
+    committed: usize,
+) -> Result<(Tensor, Tensor)> {
+    let (b, _, d) = x.dims3()?;
+    let history = match history {
+        Some(h) => h.clone(),
+        None => Tensor::zeros((b, padding, d), x.dtype(), x.device())?,
+    };
+    let with_history = Tensor::cat(&[&history, x], 1)?;
+    let next_history = with_history.narrow(1, committed, padding)?;
+    Ok((with_history.pad_with_zeros(1, 0, padding)?, next_history))
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ConformerCache {
     pub keys: Option<Tensor>,
@@ -50,30 +74,10 @@ impl ConformerCache {
         if padding == 0 {
             return Ok(x.clone());
         }
-        let (_, s, _) = x.dims3()?;
-        let device = x.device();
-        let dtype = x.dtype();
-
-        let conv_cache = if let Some(cache) = &self.conv {
-            cache.clone()
-        } else {
-            Tensor::zeros((x.dims3()?.0, padding, x.dims3()?.2), dtype, device)?
-        };
-
-        let tokens_to_cache = padding.min(s);
-        let cache_update = x.narrow(1, s - tokens_to_cache, tokens_to_cache)?;
-        let new_cache = if tokens_to_cache < padding {
-            let trimmed = conv_cache.narrow(1, tokens_to_cache, padding - tokens_to_cache)?;
-            Tensor::cat(&[&trimmed, &cache_update], 1)?
-        } else {
-            cache_update
-        };
-
-        self.conv = Some(new_cache.clone());
-        // Prepend the cached left context and zero-pad the right, like the
-        // symmetric padding of the non-streaming path.
-        let result = Tensor::cat(&[&new_cache, x], 1)?.pad_with_zeros(1, 0, padding)?;
-        Ok(result)
+        let s = x.dims3()?.1;
+        let (input, history) = conv_input_and_history(self.conv.as_ref(), x, padding, s)?;
+        self.conv = Some(history);
+        Ok(input)
     }
 }
 
@@ -182,34 +186,15 @@ impl RotatingConformerCache {
         if padding == 0 {
             return Ok(x.clone());
         }
-
-        let (_, s, _) = x.dims3()?;
-        let device = x.device();
-        let dtype = x.dtype();
-
-        let conv_cache = if let Some(cache) = &self.conv {
-            cache.clone()
-        } else {
-            Tensor::zeros((x.dims3()?.0, padding, x.dims3()?.2), dtype, device)?
-        };
-
-        let mut new_cache = conv_cache;
-        if s > self.cache_drop_size {
-            let tokens_to_cache = padding.min(s - self.cache_drop_size);
-            let cache_update = x.narrow(1, s - tokens_to_cache, tokens_to_cache)?;
-            new_cache = if tokens_to_cache < padding {
-                let trimmed = new_cache.narrow(1, tokens_to_cache, padding - tokens_to_cache)?;
-                Tensor::cat(&[&trimmed, &cache_update], 1)?
-            } else {
-                cache_update
-            };
-        }
-
-        self.conv = Some(new_cache.clone());
-        // Prepend the cached left context and zero-pad the right, like the
-        // symmetric padding of the non-streaming path.
-        let result = Tensor::cat(&[&new_cache, x], 1)?.pad_with_zeros(1, 0, padding)?;
-        Ok(result)
+        let s = x.dims3()?.1;
+        let (input, history) = conv_input_and_history(
+            self.conv.as_ref(),
+            x,
+            padding,
+            s.saturating_sub(self.cache_drop_size),
+        )?;
+        self.conv = Some(history);
+        Ok(input)
     }
 }
 
@@ -224,5 +209,56 @@ impl CacheLike for RotatingConformerCache {
 
     fn update_and_fetch_conv(&mut self, x: &Tensor, padding: usize) -> Result<Tensor> {
         RotatingConformerCache::update_and_fetch_conv(self, x, padding)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle::Device;
+
+    fn frames(values: &[f32]) -> Tensor {
+        Tensor::from_slice(values, (1, values.len(), 1), &Device::Cpu).unwrap()
+    }
+
+    fn values(t: &Tensor) -> Vec<f32> {
+        t.flatten_all().unwrap().to_vec1().unwrap()
+    }
+
+    #[test]
+    fn conv_cache_left_context_is_previous_chunk() {
+        let mut cache = ConformerCache::default();
+        let first = cache
+            .update_and_fetch_conv(&frames(&[1., 2., 3.]), 2)
+            .unwrap();
+        assert_eq!(values(&first), [0., 0., 1., 2., 3., 0., 0.]);
+        let second = cache.update_and_fetch_conv(&frames(&[4.]), 2).unwrap();
+        assert_eq!(values(&second), [2., 3., 4., 0., 0.]);
+        let third = cache.update_and_fetch_conv(&frames(&[5., 6.]), 2).unwrap();
+        assert_eq!(values(&third), [3., 4., 5., 6., 0., 0.]);
+    }
+
+    /// With a drop size, the last `drop` frames of each chunk are encoded
+    /// again in the next chunk, so the history must end before them.
+    #[test]
+    fn rotating_conv_cache_history_ends_at_committed_frames() {
+        let mut cache = RotatingConformerCache::new(16, 2);
+        let first = cache
+            .update_and_fetch_conv(&frames(&[1., 2., 3., 4.]), 1)
+            .unwrap();
+        assert_eq!(values(&first), [0., 1., 2., 3., 4., 0.]);
+        // Frames 3 and 4 were not committed and come again.
+        let second = cache
+            .update_and_fetch_conv(&frames(&[3., 4., 5.]), 1)
+            .unwrap();
+        assert_eq!(values(&second), [2., 3., 4., 5., 0.]);
+        // Only frame 3 was committed this time; a chunk shorter than the drop
+        // size commits nothing and leaves the history alone.
+        let third = cache.update_and_fetch_conv(&frames(&[4., 5.]), 1).unwrap();
+        assert_eq!(values(&third), [3., 4., 5., 0.]);
+        let fourth = cache
+            .update_and_fetch_conv(&frames(&[4., 5., 6.]), 1)
+            .unwrap();
+        assert_eq!(values(&fourth), [3., 4., 5., 6., 0.]);
     }
 }
