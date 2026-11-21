@@ -781,6 +781,37 @@ impl ParakeetTdt {
     }
 }
 
+/// Returns how many samples a chunked pass moves forward per chunk.
+///
+/// Fails unless both durations are finite, `chunk_duration > 0`,
+/// `overlap_duration >= 0`, and the overlap is shorter than the chunk
+/// after conversion to samples. A zero advance would re-process the same
+/// chunk forever.
+pub fn chunk_advance_samples(
+    chunk_duration: f64,
+    overlap_duration: f64,
+    sample_rate: usize,
+) -> Result<usize> {
+    if !chunk_duration.is_finite() || chunk_duration <= 0.0 {
+        return Err(candle::Error::Msg(format!(
+            "chunk_duration must be a positive number of seconds, got {chunk_duration}"
+        )));
+    }
+    if !overlap_duration.is_finite() || overlap_duration < 0.0 {
+        return Err(candle::Error::Msg(format!(
+            "overlap_duration must be a non-negative number of seconds, got {overlap_duration}"
+        )));
+    }
+    let chunk_samples = (chunk_duration * sample_rate as f64) as usize;
+    let overlap_samples = (overlap_duration * sample_rate as f64) as usize;
+    if overlap_samples >= chunk_samples {
+        return Err(candle::Error::Msg(format!(
+            "overlap_duration ({overlap_duration}s) must be shorter than chunk_duration ({chunk_duration}s)"
+        )));
+    }
+    Ok(chunk_samples - overlap_samples)
+}
+
 struct TranscribeParams<'a> {
     audio: &'a [f32],
     device: &'a Device,
@@ -811,6 +842,7 @@ where
     }
 
     let chunk_duration = chunk_duration.unwrap();
+    chunk_advance_samples(chunk_duration, overlap_duration, pre.sample_rate)?;
     let audio_len_sec = audio.len() as f64 / pre.sample_rate as f64;
     if audio_len_sec <= chunk_duration {
         let mel = get_logmel(audio, pre, device)?;
@@ -818,7 +850,7 @@ where
     }
 
     let chunk_samples = (chunk_duration * pre.sample_rate as f64) as usize;
-    let overlap_samples = (overlap_duration * pre.sample_rate as f64) as usize;
+    let advance = chunk_advance_samples(chunk_duration, overlap_duration, pre.sample_rate)?;
     let mut all_tokens = Vec::new();
 
     let mut start = 0usize;
@@ -863,7 +895,7 @@ where
         if end == audio.len() {
             break;
         }
-        start += chunk_samples.saturating_sub(overlap_samples);
+        start += advance;
     }
 
     Ok(sentences_to_result(&tokens_to_sentences(
@@ -1525,6 +1557,64 @@ impl Drop for StreamingParakeet<'_> {
 mod tests {
     use super::*;
     use candle::{DType, Device, Tensor};
+
+    #[test]
+    fn chunk_advance_rejects_overlap_not_shorter_than_chunk() {
+        // The default --overlap-duration is 15; --chunk-duration 10 used to hang.
+        assert!(chunk_advance_samples(10.0, 15.0, 16_000).is_err());
+        assert!(chunk_advance_samples(10.0, 10.0, 16_000).is_err());
+    }
+
+    #[test]
+    fn chunk_advance_rejects_invalid_durations() {
+        assert!(chunk_advance_samples(0.0, 0.0, 16_000).is_err());
+        assert!(chunk_advance_samples(-1.0, 0.0, 16_000).is_err());
+        assert!(chunk_advance_samples(f64::NAN, 0.0, 16_000).is_err());
+        assert!(chunk_advance_samples(10.0, -1.0, 16_000).is_err());
+        assert!(chunk_advance_samples(10.0, f64::INFINITY, 16_000).is_err());
+    }
+
+    #[test]
+    fn chunk_advance_is_chunk_minus_overlap() {
+        assert_eq!(chunk_advance_samples(30.0, 15.0, 16_000).unwrap(), 240_000);
+        assert_eq!(chunk_advance_samples(10.0, 0.0, 16_000).unwrap(), 160_000);
+    }
+
+    #[test]
+    fn transcribe_with_audio_rejects_overlap_before_looping() {
+        let pre: PreprocessArgs = serde_json::from_value(serde_json::json!({
+            "sample_rate": 16000,
+            "normalize": "per_feature",
+            "window_size": 0.025,
+            "window_stride": 0.01,
+            "window": "hann",
+            "features": 128,
+            "n_fft": 512,
+            "dither": 0.0
+        }))
+        .unwrap();
+        let audio = vec![0.0f32; 16_000 * 20];
+        let config = DecodingConfig::default();
+        let mut calls = 0usize;
+        let mut generate = |_: &Tensor, _: &DecodingConfig| -> Result<AlignedResult> {
+            calls += 1;
+            Err(candle::Error::Msg("generate must not run".to_string()))
+        };
+        let result = transcribe_with_audio(
+            TranscribeParams {
+                audio: &audio,
+                device: &Device::Cpu,
+                pre: &pre,
+                config: &config,
+                chunk_duration: Some(10.0),
+                overlap_duration: 15.0,
+                chunk_callback: None,
+            },
+            &mut generate,
+        );
+        assert!(result.is_err());
+        assert_eq!(calls, 0);
+    }
 
     #[test]
     fn confidence_from_logits_uniform_distribution() {

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use hf_hub::{HFClientSync, HFRepositorySync, RepoTypeModel, split_id};
 use parakeet_candle::parakeet::{
     AlignedResult, AlignedSentence, AlignedToken, AudioReader, Beam, Decoding, DecodingConfig,
@@ -47,12 +47,12 @@ struct Args {
     #[arg(long)]
     input: PathBuf,
 
-    /// Chunk duration in seconds for long audio.
-    #[arg(long)]
+    /// Chunk duration in seconds for long audio. Must be longer than --overlap-duration.
+    #[arg(long, value_parser = parse_positive_secs)]
     chunk_duration: Option<f64>,
 
-    /// Overlap duration in seconds when chunking.
-    #[arg(long, default_value_t = 15.0)]
+    /// Overlap duration in seconds when chunking. Must be shorter than --chunk-duration.
+    #[arg(long, default_value_t = 15.0, value_parser = parse_non_negative_secs)]
     overlap_duration: f64,
 
     /// Beam size for TDT decoding.
@@ -75,9 +75,54 @@ struct Args {
     #[arg(long, default_value_t = false, conflicts_with = "chunk_duration")]
     stream: bool,
 
-    /// Audio chunk duration in seconds per streaming iteration.
-    #[arg(long, default_value_t = 30.0)]
+    /// Audio chunk duration in seconds per streaming iteration (minimum 5).
+    /// Consecutive chunks overlap by min(15, chunk / 2) seconds; --overlap-duration
+    /// does not apply to --stream.
+    #[arg(long, default_value_t = 30.0, value_parser = parse_positive_secs)]
     stream_chunk_secs: f64,
+}
+
+fn parse_secs(s: &str) -> Result<f64, String> {
+    let secs: f64 = s.parse().map_err(|e| format!("{e}"))?;
+    if !secs.is_finite() {
+        return Err(format!("expected a finite number of seconds, got {s}"));
+    }
+    Ok(secs)
+}
+
+fn parse_positive_secs(s: &str) -> Result<f64, String> {
+    let secs = parse_secs(s)?;
+    if secs <= 0.0 {
+        return Err(format!("must be greater than 0, got {s}"));
+    }
+    Ok(secs)
+}
+
+fn parse_non_negative_secs(s: &str) -> Result<f64, String> {
+    let secs = parse_secs(s)?;
+    if secs < 0.0 {
+        return Err(format!("must not be negative, got {s}"));
+    }
+    Ok(secs)
+}
+
+/// Rejects a chunk/overlap pair that would never advance through the audio.
+fn validate_chunking(chunk_duration: Option<f64>, overlap_duration: f64) -> Result<(), String> {
+    match chunk_duration {
+        Some(chunk) if overlap_duration >= chunk => Err(format!(
+            "--overlap-duration ({overlap_duration}s) must be shorter than --chunk-duration ({chunk}s)"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Returns `(chunk, overlap)` in seconds for `--stream`.
+///
+/// The chunk is at least 5 s and the overlap is `min(15, chunk / 2)`, so each
+/// iteration always advances by at least half a chunk.
+fn stream_window(stream_chunk_secs: f64) -> (f64, f64) {
+    let chunk = stream_chunk_secs.max(5.0);
+    (chunk, (chunk / 2.0).min(15.0))
 }
 
 #[derive(serde::Serialize)]
@@ -309,16 +354,16 @@ fn transcribe_streaming(
         merge_longest_common_subsequence, merge_longest_contiguous, sentences_to_result,
         tokens_to_sentences,
     };
+    use parakeet_candle::parakeet::model::chunk_advance_samples;
     use std::io::Write;
 
     let sample_rate = model.sample_rate();
     let mut audio_reader =
         AudioReader::open(&args.input, sample_rate).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let chunk_duration = args.stream_chunk_secs.max(5.0);
-    let overlap_duration = chunk_duration.min(15.0);
+    let (chunk_duration, overlap_duration) = stream_window(args.stream_chunk_secs);
     let chunk_samples = (chunk_duration * sample_rate as f64) as usize;
-    let overlap_samples = (overlap_duration * sample_rate as f64) as usize;
+    let advance = chunk_advance_samples(chunk_duration, overlap_duration, sample_rate)?;
 
     let pre = model.preprocessor_config().clone();
     let device = model.device_ref().clone();
@@ -409,7 +454,6 @@ fn transcribe_streaming(
             break;
         }
 
-        let advance = chunk_samples.saturating_sub(overlap_samples);
         audio_offset += advance;
         if advance < chunk_audio.len() {
             leftover = chunk_audio[advance..].to_vec();
@@ -431,6 +475,11 @@ fn transcribe_streaming(
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    if let Err(msg) = validate_chunking(args.chunk_duration, args.overlap_duration) {
+        Args::command()
+            .error(clap::error::ErrorKind::ArgumentConflict, msg)
+            .exit();
+    }
     let t0 = Instant::now();
 
     let device = device(args.cpu)?;
@@ -560,4 +609,51 @@ fn main() -> Result<()> {
         debug_log!(t0, "done");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parakeet_candle::parakeet::model::chunk_advance_samples;
+
+    #[test]
+    fn stream_window_always_advances() {
+        // Chunks <= 15 s used to get overlap == chunk and loop forever.
+        for secs in [0.1, 5.0, 7.5, 10.0, 15.0, 20.0, 30.0, 60.0, 600.0] {
+            let (chunk, overlap) = stream_window(secs);
+            let advance = chunk_advance_samples(chunk, overlap, 16_000).unwrap();
+            assert!(advance > 0, "stream_chunk_secs={secs} gave zero advance");
+        }
+    }
+
+    #[test]
+    fn stream_window_overlap_rule() {
+        assert_eq!(stream_window(1.0), (5.0, 2.5));
+        assert_eq!(stream_window(10.0), (10.0, 5.0));
+        assert_eq!(stream_window(30.0), (30.0, 15.0));
+        assert_eq!(stream_window(60.0), (60.0, 15.0));
+    }
+
+    #[test]
+    fn validate_chunking_rejects_overlap_not_shorter_than_chunk() {
+        // Default --overlap-duration 15 with --chunk-duration 10 used to hang.
+        assert!(validate_chunking(Some(10.0), 15.0).is_err());
+        assert!(validate_chunking(Some(15.0), 15.0).is_err());
+        assert!(validate_chunking(Some(30.0), 15.0).is_ok());
+        assert!(validate_chunking(None, 15.0).is_ok());
+    }
+
+    #[test]
+    fn cli_rejects_bad_durations() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["parakeet", "--input", "a.wav"];
+            argv.extend_from_slice(extra);
+            Args::try_parse_from(argv)
+        };
+        assert!(parse(&["--chunk-duration", "0"]).is_err());
+        assert!(parse(&["--chunk-duration", "NaN"]).is_err());
+        assert!(parse(&["--overlap-duration", "-1"]).is_err());
+        assert!(parse(&["--stream-chunk-secs", "inf"]).is_err());
+        assert!(parse(&["--chunk-duration", "30"]).is_ok());
+    }
 }
