@@ -95,34 +95,55 @@ pub fn load_audio(path: &std::path::Path, sampling_rate: usize) -> Result<Vec<f3
 
 const RESAMPLE_CHUNK_SIZE: usize = 1024;
 
-/// Largest input block the FFT resampler may need, in frames. The block is
-/// `source_sr / gcd(source_sr, target_sr)`: 441 for 44.1 kHz or 22.05 kHz to
-/// 16 kHz, 3 for 48 kHz. Rates with no useful common divisor fall back to sinc
+/// Minimum FFT output block, in frames. rubato's FFT resampler builds its
+/// anti-aliasing filter on this block, so a short block rolls off well below
+/// Nyquist. 512 frames keeps the response flat to 7.5 kHz at a 16 kHz target
+/// for every input rate tested from 22.05 to 192 kHz, which covers the top of
+/// Parakeet's mel filterbank.
+const MIN_FFT_OUTPUT_BLOCK: usize = 512;
+
+/// Largest FFT block allowed on either side. Rate pairs with no useful common
+/// divisor (for example 44,101 Hz) would need huge blocks, so they use sinc
 /// interpolation, which works for any ratio.
-const MAX_FFT_BLOCK: usize = 4096;
+const MAX_FFT_BLOCK: usize = 16_384;
 
 fn gcd(a: usize, b: usize) -> usize {
     if b == 0 { a } else { gcd(b, a % b) }
+}
+
+/// FFT block sizes `(input, output)` for a rate pair, or `None` if the pair
+/// needs blocks larger than [`MAX_FFT_BLOCK`]. Both sizes are even, since an
+/// odd block makes rubato's reported delay off by a fraction of a sample.
+fn fft_block_sizes(source_sr: usize, target_sr: usize) -> Option<(usize, usize)> {
+    let g = gcd(source_sr, target_sr);
+    let (min_in, min_out) = (source_sr / g, target_sr / g);
+    let mut blocks = MIN_FFT_OUTPUT_BLOCK.div_ceil(min_out);
+    if (blocks * min_in) % 2 == 1 || (blocks * min_out) % 2 == 1 {
+        blocks *= 2;
+    }
+    let (fft_in, fft_out) = (blocks.checked_mul(min_in)?, blocks.checked_mul(min_out)?);
+    (fft_in <= MAX_FFT_BLOCK && fft_out <= MAX_FFT_BLOCK).then_some((fft_in, fft_out))
 }
 
 fn make_resampler(
     source_sr: usize,
     target_sr: usize,
 ) -> std::result::Result<Box<dyn Resampler<f32>>, String> {
-    let fft_block = source_sr / gcd(source_sr, target_sr);
-    let resampler: Box<dyn Resampler<f32>> = if fft_block <= MAX_FFT_BLOCK {
-        Box::new(
-            rubato::Fft::new(
+    let resampler: Box<dyn Resampler<f32>> = match fft_block_sizes(source_sr, target_sr) {
+        // One sub-chunk of exactly `fft_in` frames makes rubato use these sizes.
+        Some((fft_in, _)) => Box::new(
+            rubato::Fft::new_custom(
                 source_sr,
                 target_sr,
-                RESAMPLE_CHUNK_SIZE,
+                fft_in,
                 1,
+                1,
+                WindowFunction::BlackmanHarris2,
                 FixedSync::Input,
             )
             .map_err(|e| format!("resampler creation failed: {e}"))?,
-        )
-    } else {
-        Box::new(sinc_resampler(source_sr, target_sr)?)
+        ),
+        None => Box::new(sinc_resampler(source_sr, target_sr)?),
     };
     Ok(resampler)
 }
@@ -151,6 +172,8 @@ fn sinc_resampler(source_sr: usize, target_sr: usize) -> std::result::Result<Asy
 /// the total output length is `ceil(input_len * ratio)`.
 struct StreamResampler {
     resampler: Box<dyn Resampler<f32>>,
+    source_sr: usize,
+    target_sr: usize,
     pending: Vec<f32>,
     scratch: Vec<f32>,
     delay_left: usize,
@@ -165,6 +188,8 @@ impl StreamResampler {
             delay_left: resampler.output_delay(),
             scratch: vec![0.0; resampler.output_frames_max()],
             resampler,
+            source_sr,
+            target_sr,
             pending: Vec::new(),
             input_len: 0,
             output_len: 0,
@@ -199,7 +224,9 @@ impl StreamResampler {
     }
 
     fn expected_output_len(&self) -> usize {
-        (self.input_len as f64 * self.resampler.resample_ratio()).ceil() as usize
+        let len =
+            (self.input_len as u128 * self.target_sr as u128).div_ceil(self.source_sr as u128);
+        len as usize
     }
 
     /// Run one resampler call on `pending[offset..offset + frames]`. Returns
@@ -827,56 +854,103 @@ mod tests {
     fn resample_in_pieces(input: &[f32], src: usize, dst: usize, piece: usize) -> Vec<f32> {
         let mut resampler = StreamResampler::new(src, dst).unwrap();
         let mut out = Vec::new();
-        for chunk in input.chunks(piece) {
+        for chunk in input.chunks(piece.max(1)) {
             resampler.push(chunk, &mut out).unwrap();
         }
         resampler.finish(&mut out).unwrap();
         out
     }
 
-    /// Resampling a sine must give the same sine at the new rate: correct
-    /// length, no startup delay, and no drift. Edges are skipped because the
-    /// filter sees silence beyond the clip.
-    ///
-    /// rubato leaves a sub-sample offset (under one output sample, ~60 µs), so
-    /// the tolerance allows that much phase error at 440 Hz. An untrimmed
-    /// startup delay is 46+ output samples here and fails by a wide margin.
-    fn assert_resampled_sine(src: usize, dst: usize) {
-        let secs = 2.0;
-        let input = sine(440.0, src, (secs * src as f64) as usize);
+    /// Peak amplitude of a unit sine at `freq` after resampling, measured away
+    /// from the clip edges.
+    fn tone_gain(src: usize, dst: usize, freq: f64) -> f64 {
+        let out = resample_in_pieces(&sine(freq, src, src), src, dst, 4096);
+        let mid = &out[dst / 4..out.len() - dst / 4];
+        let mean_sq = mid.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / mid.len() as f64;
+        (2.0 * mean_sq).sqrt()
+    }
+
+    /// Resampling a 1 kHz sine must give the same sine at the new rate: exact
+    /// length, no startup delay, no drift. `max_lag` is the allowed phase
+    /// offset in output samples. Edges are skipped because the filter sees
+    /// silence beyond the clip.
+    fn assert_resampled_sine(src: usize, dst: usize, max_lag: f32) {
+        let input = sine(1000.0, src, 2 * src);
         let out = resample_in_pieces(&input, src, dst, 1000);
-        let want = sine(440.0, dst, out.len());
-        let expected_len = (input.len() as f64 * dst as f64 / src as f64).ceil() as usize;
-        assert_eq!(out.len(), expected_len, "{src} -> {dst}: output length");
-        let edge = dst / 20;
+        assert_eq!(out.len(), 2 * dst, "{src} -> {dst}: output length");
+        let want = sine(1000.0, dst, out.len());
+        let edge = dst / 4;
         let max_err = out[edge..out.len() - edge]
             .iter()
             .zip(&want[edge..])
             .map(|(a, b)| (a - b).abs())
             .fold(0f32, f32::max);
-        let one_sample_phase_err = 2.0 * std::f32::consts::PI * 440.0 / dst as f32;
+        // A phase offset of `lag` samples gives a peak error of about
+        // 2*pi*f*lag/dst for a unit sine.
+        let limit = 2.0 * std::f32::consts::PI * 1000.0 * max_lag / dst as f32;
         assert!(
-            max_err < one_sample_phase_err,
-            "{src} -> {dst}: max error {max_err}"
+            max_err < limit,
+            "{src} -> {dst}: max error {max_err}, limit {limit}"
         );
     }
 
     #[test]
-    fn fft_resampler_common_rates() {
-        for src in [8000, 22050, 44100, 48000] {
-            assert_resampled_sine(src, 16000);
+    fn fft_resampler_is_aligned() {
+        // 7 and 8 kHz upsample. 11,025 and 22,050 Hz have odd minimum blocks.
+        for src in [7000, 8000, 11025, 22050, 32000, 44100, 48000, 96000, 192000] {
+            assert!(
+                fft_block_sizes(src, 16000).is_some(),
+                "{src} should use FFT"
+            );
+            assert_resampled_sine(src, 16000, 0.05);
         }
     }
 
     #[test]
-    fn sinc_fallback_for_awkward_rate() {
-        // gcd(44101, 16000) = 1, so the FFT block would be 44101 frames.
-        assert!(44101 / gcd(44101, 16000) > MAX_FFT_BLOCK);
-        assert_resampled_sine(44101, 16000);
+    fn fft_resampler_passband_and_stopband() {
+        for src in [22050, 44100, 48000, 96000, 192000] {
+            for freq in [1000.0, 4000.0, 7000.0, 7500.0] {
+                let gain = tone_gain(src, 16000, freq);
+                assert!(gain > 0.98, "{src} Hz: {freq} Hz tone kept {gain:.3}");
+            }
+            // 9 kHz is above the 8 kHz output Nyquist and would alias to 7 kHz.
+            let alias = tone_gain(src, 16000, 9000.0);
+            assert!(alias < 0.01, "{src} Hz: 9 kHz alias {alias:.4}");
+        }
     }
 
     #[test]
-    fn resampler_output_independent_of_push_sizes() {
+    fn fft_block_sizes_are_even_and_bounded() {
+        for src in [7000, 8000, 11025, 22050, 44100, 48000, 192000] {
+            let (fft_in, fft_out) = fft_block_sizes(src, 16000).unwrap();
+            assert_eq!(fft_in % 2, 0, "{src}: input block {fft_in}");
+            assert_eq!(fft_out % 2, 0, "{src}: output block {fft_out}");
+            assert!(fft_out >= MIN_FFT_OUTPUT_BLOCK);
+        }
+        // No useful common divisor, or an extreme ratio: use sinc instead.
+        assert_eq!(fft_block_sizes(44101, 16000), None);
+        assert_eq!(fft_block_sizes(1, 16000), None);
+    }
+
+    #[test]
+    fn sinc_fallback_is_aligned() {
+        assert_resampled_sine(44101, 16000, 1.0);
+        assert_resampled_sine(8463, 16000, 1.0);
+    }
+
+    #[test]
+    fn output_length_is_exact() {
+        // 8463 * 16000 / 8463 is exactly 16000; float rounding gave 16001.
+        assert_eq!(
+            resample_in_pieces(&vec![0.0; 8463], 8463, 16000, 1000).len(),
+            16000
+        );
+        assert_eq!(resample_in_pieces(&[0.5; 10], 44100, 16000, 10).len(), 4);
+        assert!(resample_in_pieces(&[], 44100, 16000, 1).is_empty());
+    }
+
+    #[test]
+    fn output_independent_of_push_sizes() {
         let input = sine(300.0, 44100, 30_000);
         let a = resample_in_pieces(&input, 44100, 16000, 1);
         let b = resample_in_pieces(&input, 44100, 16000, 4093);
@@ -886,13 +960,5 @@ mod tests {
         for (x, (y, z)) in a.iter().zip(b.iter().zip(&c)) {
             assert!((x - y).abs() < 1e-5 && (x - z).abs() < 1e-5);
         }
-    }
-
-    #[test]
-    fn resampler_short_input() {
-        let out = resample_in_pieces(&[0.5; 10], 44100, 16000, 10);
-        assert_eq!(out.len(), 4);
-        let out = resample_in_pieces(&[], 44100, 16000, 1);
-        assert!(out.is_empty());
     }
 }
