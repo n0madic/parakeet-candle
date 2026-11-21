@@ -15,7 +15,7 @@ intel-mkl-src = { version = "0.8.1", optional = true }
 rubato = "5.1.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-symphonia = { version = "0.6.1", features = ["mp3", "aac"] }
+symphonia = { version = "0.6.1", features = ["mp3", "aac", "isomp4"] }
 
 [features]
 default = []
