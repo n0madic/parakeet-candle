@@ -1,5 +1,7 @@
 use audioadapter_buffers::direct::InterleavedSlice;
 use candle::{DType, Device, Result, Tensor};
+use realfft::RealFftPlanner;
+use realfft::num_complex::Complex;
 use rubato::{
     Async, FixedAsync, Indexing, Resampler, SincInterpolationParameters, SincInterpolationType,
     WindowFunction,
@@ -63,6 +65,13 @@ impl PreprocessArgs {
             return Err(candle::Error::Msg(
                 "n_fft must be a positive power of 2".to_string(),
             ));
+        }
+        if self.win_length() > self.n_fft {
+            return Err(candle::Error::Msg(format!(
+                "window length ({}) must not exceed n_fft ({})",
+                self.win_length(),
+                self.n_fft
+            )));
         }
         if self.features == 0 {
             return Err(candle::Error::Msg("features must be > 0".to_string()));
@@ -352,68 +361,6 @@ fn mel_filterbank(sr: usize, n_fft: usize, n_mels: usize) -> Vec<f32> {
     filters
 }
 
-/// Compute the FFT of `inp`. Non-power-of-2 lengths are zero-padded to the
-/// next power of 2 so the recursive radix-2 path is always used (O(n log n)).
-fn fft(inp: &[f32]) -> Vec<f32> {
-    let n = inp.len();
-    if n == 0 {
-        return vec![];
-    }
-    if n == 1 {
-        return vec![inp[0], 0.0];
-    }
-    let n_padded = n.next_power_of_two();
-    if n_padded != n {
-        let mut padded = vec![0f32; n_padded];
-        padded[..n].copy_from_slice(inp);
-        return fft_radix2(&padded);
-    }
-    fft_radix2(inp)
-}
-
-/// Radix-2 Cooley-Tukey FFT. Input length MUST be a power of 2.
-fn fft_radix2(inp: &[f32]) -> Vec<f32> {
-    let n = inp.len();
-    debug_assert!(n.is_power_of_two(), "fft_radix2 requires power-of-2 length");
-    if n == 1 {
-        return vec![inp[0], 0.0];
-    }
-    let mut out = vec![0f32; n * 2];
-
-    let mut even = Vec::with_capacity(n / 2);
-    let mut odd = Vec::with_capacity(n / 2);
-
-    for (i, &value) in inp.iter().enumerate() {
-        if i % 2 == 0 {
-            even.push(value);
-        } else {
-            odd.push(value);
-        }
-    }
-
-    let even_fft = fft_radix2(&even);
-    let odd_fft = fft_radix2(&odd);
-
-    let two_pi = std::f32::consts::PI * 2.0;
-    let n_t = n as f32;
-    for k in 0..n / 2 {
-        let k_t = k as f32;
-        let theta = two_pi * k_t / n_t;
-        let re = theta.cos();
-        let im = -theta.sin();
-
-        let re_odd = odd_fft[2 * k];
-        let im_odd = odd_fft[2 * k + 1];
-
-        out[2 * k] = even_fft[2 * k] + re * re_odd - im * im_odd;
-        out[2 * k + 1] = even_fft[2 * k + 1] + re * im_odd + im * re_odd;
-
-        out[2 * (k + n / 2)] = even_fft[2 * k] - re * re_odd + im * im_odd;
-        out[2 * (k + n / 2) + 1] = even_fft[2 * k + 1] - re * im_odd - im * re_odd;
-    }
-    out
-}
-
 fn window_values(kind: &str, len: usize) -> Vec<f32> {
     match kind {
         // Periodic form: 2π·i/N (matches torch.hann_window(periodic=True) / NeMo)
@@ -465,6 +412,18 @@ fn reflect_pad(samples: &[f32], pad: usize) -> Vec<f32> {
     out
 }
 
+/// Magnitude of one FFT bin raised to `power`. The `power == 2` case skips the
+/// square root.
+fn spectral_magnitude(bin: Complex<f32>, power: f64) -> f32 {
+    if (power - 2.0).abs() <= f64::EPSILON {
+        bin.norm_sqr()
+    } else if (power - 1.0).abs() <= f64::EPSILON {
+        bin.norm()
+    } else {
+        bin.norm().powf(power as f32)
+    }
+}
+
 pub fn get_logmel(samples: &[f32], args: &PreprocessArgs, device: &Device) -> Result<Tensor> {
     let mut audio = samples.to_vec();
     if args.pad_to > 0 && audio.len() < args.pad_to {
@@ -499,33 +458,30 @@ pub fn get_logmel(samples: &[f32], args: &PreprocessArgs, device: &Device) -> Re
     let n_fft_bins = n_fft / 2 + 1;
     let filters = mel_filterbank(args.sample_rate, n_fft, args.features);
 
+    let fft = RealFftPlanner::<f32>::new().plan_fft_forward(n_fft);
+    let mut frame_buf = fft.make_input_vec();
+    let mut spectrum = fft.make_output_vec();
+    let mut scratch = fft.make_scratch_vec();
+    let mut mags = vec![0f32; n_fft_bins];
+
     let mut mel = vec![0f32; args.features * frame_count];
     for frame in 0..frame_count {
         let start = frame * hop_length;
-        let mut frame_buf = vec![0f32; n_fft];
         let slice = &padded[start..start + win_length];
-        for (i, &v) in slice.iter().enumerate() {
-            frame_buf[i] = v * window[i];
+        for ((dst, &v), &w) in frame_buf.iter_mut().zip(slice).zip(&window) {
+            *dst = v * w;
         }
+        frame_buf[win_length..].fill(0.0);
 
-        let fft_out = fft(&frame_buf);
-        let mut mags = vec![0f32; n_fft_bins];
-        for k in 0..n_fft_bins {
-            let re = fft_out[2 * k];
-            let im = fft_out[2 * k + 1];
-            let mut mag = re.hypot(im);
-            if (args.mag_power - 1.0).abs() > f64::EPSILON {
-                mag = mag.powf(args.mag_power as f32);
-            }
-            mags[k] = mag;
+        fft.process_with_scratch(&mut frame_buf, &mut spectrum, &mut scratch)
+            .map_err(candle::Error::wrap)?;
+        for (mag, bin) in mags.iter_mut().zip(&spectrum) {
+            *mag = spectral_magnitude(*bin, args.mag_power);
         }
 
         for mel_idx in 0..args.features {
-            let mut sum = 0.0f32;
-            let filter_offset = mel_idx * n_fft_bins;
-            for k in 0..n_fft_bins {
-                sum += filters[filter_offset + k] * mags[k];
-            }
+            let filter = &filters[mel_idx * n_fft_bins..(mel_idx + 1) * n_fft_bins];
+            let sum: f32 = filter.iter().zip(&mags).map(|(f, m)| f * m).sum();
             mel[mel_idx * frame_count + frame] = (sum + 1e-5).ln();
         }
     }
@@ -569,50 +525,55 @@ pub fn get_logmel(samples: &[f32], args: &PreprocessArgs, device: &Device) -> Re
 mod tests {
     use super::*;
 
+    /// Power spectrum by direct DFT, used as an independent reference.
+    fn naive_power_spectrum(signal: &[f32]) -> Vec<f32> {
+        let n = signal.len();
+        (0..=n / 2)
+            .map(|k| {
+                let (mut re, mut im) = (0f64, 0f64);
+                for (i, &x) in signal.iter().enumerate() {
+                    let theta = -2.0 * std::f64::consts::PI * (k * i) as f64 / n as f64;
+                    re += x as f64 * theta.cos();
+                    im += x as f64 * theta.sin();
+                }
+                (re * re + im * im) as f32
+            })
+            .collect()
+    }
+
     #[test]
-    fn fft_dc_signal() {
-        let signal = vec![1.0f32; 8];
-        let result = fft(&signal);
-        assert!((result[0] - 8.0).abs() < 1e-5);
-        assert!(result[1].abs() < 1e-5);
-        for i in 1..8 {
-            assert!(result[2 * i].abs() < 1e-4, "bin {i} re = {}", result[2 * i]);
-            assert!(
-                result[2 * i + 1].abs() < 1e-4,
-                "bin {i} im = {}",
-                result[2 * i + 1]
-            );
+    fn realfft_power_matches_naive_dft() {
+        let n = 512;
+        let signal: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / 16000.0;
+                (2.0 * std::f32::consts::PI * 440.0 * t).sin()
+                    + 0.3 * (2.0 * std::f32::consts::PI * 3100.0 * t).cos()
+                    + 0.01 * ((i * 7919) % 101) as f32
+            })
+            .collect();
+        let fft = RealFftPlanner::<f32>::new().plan_fft_forward(n);
+        let mut input = signal.clone();
+        let mut spectrum = fft.make_output_vec();
+        fft.process(&mut input, &mut spectrum).unwrap();
+        let got: Vec<f32> = spectrum
+            .iter()
+            .map(|&bin| spectral_magnitude(bin, 2.0))
+            .collect();
+        let want = naive_power_spectrum(&signal);
+        assert_eq!(got.len(), want.len());
+        let peak = want.iter().cloned().fold(0f32, f32::max);
+        for (k, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert!((g - w).abs() <= 1e-4 * peak, "bin {k}: got {g}, want {w}");
         }
     }
 
     #[test]
-    fn fft_single_cosine() {
-        // cos(2*pi*k*n/N) for k=1, N=8: energy in bins 1 and 7
-        let n = 8;
-        let signal: Vec<f32> = (0..n)
-            .map(|i| (2.0 * std::f32::consts::PI * i as f32 / n as f32).cos())
-            .collect();
-        let result = fft(&signal);
-        let mag_bin1 = (result[2] * result[2] + result[3] * result[3]).sqrt();
-        assert!(
-            (mag_bin1 - 4.0).abs() < 1e-3,
-            "bin 1 magnitude = {mag_bin1}"
-        );
-        assert!(result[0].abs() < 1e-3, "bin 0 = {}", result[0]);
-    }
-
-    #[test]
-    fn fft_odd_length_zero_padded() {
-        let signal = vec![1.0, 2.0, 3.0];
-        let result = fft(&signal);
-        assert!((result[0] - 6.0).abs() < 1e-4);
-        assert_eq!(result.len(), 8);
-    }
-
-    #[test]
-    fn fft_empty_input() {
-        let result = fft(&[]);
-        assert!(result.is_empty());
+    fn spectral_magnitude_powers() {
+        let bin = Complex::new(3.0f32, 4.0);
+        assert_eq!(spectral_magnitude(bin, 1.0), 5.0);
+        assert_eq!(spectral_magnitude(bin, 2.0), 25.0);
+        assert!((spectral_magnitude(bin, 3.0) - 125.0).abs() < 1e-3);
     }
 
     #[test]
@@ -713,6 +674,13 @@ mod tests {
     fn preprocess_args_non_power_of_two_nfft() {
         let mut args = valid_preprocess_args();
         args.n_fft = 400;
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn preprocess_args_window_longer_than_nfft() {
+        let mut args = valid_preprocess_args();
+        args.window_size = 0.064; // 1024 samples at 16 kHz
         assert!(args.validate().is_err());
     }
 
