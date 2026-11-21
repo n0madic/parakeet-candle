@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use hf_hub::{Repo, RepoType, api::sync::Api};
+use hf_hub::{HFClientSync, HFRepositorySync, RepoTypeModel, split_id};
 use parakeet_candle::parakeet::{
     AlignedResult, AlignedSentence, AlignedToken, AudioReader, Beam, Decoding, DecodingConfig,
     Greedy, ParakeetModel, from_config_value, get_logmel, load_audio,
@@ -108,12 +108,19 @@ fn device(cpu: bool) -> Result<Device> {
     }
 }
 
+fn hub_file(repo: &HFRepositorySync<RepoTypeModel>, filename: &str) -> hf_hub::HFResult<PathBuf> {
+    repo.download_file()
+        .filename(filename)
+        .local_files_only(true)
+        .send()
+        .or_else(|_| repo.download_file().filename(filename).send())
+}
+
 fn hub_load_safetensors(
-    repo: &hf_hub::api::sync::ApiRepo,
-    json_file: &str,
+    repo: &HFRepositorySync<RepoTypeModel>,
+    json_path: &Path,
 ) -> Result<Vec<PathBuf>> {
-    let json_path = repo.get(json_file).map_err(candle::Error::wrap)?;
-    let reader = File::open(&json_path)?;
+    let reader = File::open(json_path)?;
     let json: serde_json::Value = serde_json::from_reader(reader).map_err(candle::Error::wrap)?;
     let weight_map = match json.get("weight_map") {
         None => anyhow::bail!("no weight map in {json_path:?}"),
@@ -129,11 +136,7 @@ fn hub_load_safetensors(
 
     files
         .into_iter()
-        .map(|file| {
-            repo.get(&file)
-                .map_err(candle::Error::wrap)
-                .map_err(anyhow::Error::from)
-        })
+        .map(|file| hub_file(repo, &file).with_context(|| format!("loading weight shard {file}")))
         .collect()
 }
 
@@ -317,7 +320,6 @@ fn transcribe_streaming(
     let chunk_samples = (chunk_duration * sample_rate as f64) as usize;
     let overlap_samples = (overlap_duration * sample_rate as f64) as usize;
 
-    // Clone config values upfront to avoid borrow issues with model
     let pre = model.preprocessor_config().clone();
     let device = model.device_ref().clone();
 
@@ -328,7 +330,6 @@ fn transcribe_streaming(
     let progressive = matches!(args.format, OutputFormat::Text) && !args.timestamps;
 
     loop {
-        // Build chunk: leftover from overlap + new audio
         let mut chunk_audio = std::mem::take(&mut leftover);
         let needed = chunk_samples.saturating_sub(chunk_audio.len());
         if needed > 0 {
@@ -352,7 +353,6 @@ fn transcribe_streaming(
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .swap_remove(0);
 
-        // Adjust token timestamps by the audio offset
         let chunk_offset_secs = audio_offset as f64 / sample_rate as f64;
         for sentence in chunk_result.sentences.iter_mut() {
             for token in sentence.tokens.iter_mut() {
@@ -361,7 +361,6 @@ fn transcribe_streaming(
             }
         }
 
-        // Merge with previous tokens
         if all_tokens.is_empty() {
             all_tokens = chunk_result.tokens();
         } else {
@@ -378,12 +377,8 @@ fn transcribe_streaming(
             }
         }
 
-        // Progressive output: print only tokens we haven't printed yet.
-        // Overlap merging may rewrite the tail, but tokens before the overlap
-        // boundary are stable — safe to print and never revisit.
+        // The next merge can revise tokens that start in the overlap.
         if progressive && all_tokens.len() > printed_tokens {
-            // Tokens in the overlap region may still change on the next merge,
-            // so only print tokens whose end time is before the overlap boundary.
             let safe_boundary =
                 audio_offset as f64 / sample_rate as f64 + chunk_duration - overlap_duration;
             let safe_count = all_tokens
@@ -409,13 +404,11 @@ fn transcribe_streaming(
             );
         }
 
-        // Check if we've consumed all audio
         let is_last = chunk_audio.len() < chunk_samples;
         if is_last {
             break;
         }
 
-        // Keep overlap for the next chunk
         let advance = chunk_samples.saturating_sub(overlap_samples);
         audio_offset += advance;
         if advance < chunk_audio.len() {
@@ -423,7 +416,6 @@ fn transcribe_streaming(
         }
     }
 
-    // Print remaining tokens that were in the overlap zone
     if progressive {
         for token in &all_tokens[printed_tokens..] {
             print!("{}", token.text);
@@ -446,13 +438,14 @@ fn main() -> Result<()> {
         debug_log!(t0, "device={device:?}");
     }
 
-    let api = Api::new()?;
-    let repo = api.repo(Repo::new(args.model_id.clone(), RepoType::Model));
+    let api = HFClientSync::new()?;
+    let (owner, name) = split_id(&args.model_id);
+    let repo = api.model(owner, name);
 
     if args.debug {
         debug_log!(t0, "fetching config from {}", args.model_id);
     }
-    let config_path = repo.get("config.json").context("missing config.json")?;
+    let config_path = hub_file(&repo, "config.json").context("loading config.json")?;
     if args.debug {
         debug_log!(t0, "config loaded from {}", config_path.display());
     }
@@ -461,9 +454,9 @@ fn main() -> Result<()> {
     if args.debug {
         debug_log!(t0, "fetching model weights from {}", args.model_id);
     }
-    let safetensors_files = match repo.get("model.safetensors.index.json") {
-        Ok(_) => hub_load_safetensors(&repo, "model.safetensors.index.json")?,
-        Err(_) => vec![repo.get("model.safetensors")?],
+    let safetensors_files = match hub_file(&repo, "model.safetensors.index.json") {
+        Ok(index_path) => hub_load_safetensors(&repo, &index_path)?,
+        Err(_) => vec![hub_file(&repo, "model.safetensors").context("loading model.safetensors")?],
     };
     if args.debug {
         let total_bytes: u64 = safetensors_files
@@ -508,7 +501,6 @@ fn main() -> Result<()> {
         print_debug(&mut model, &args.input)?;
     }
 
-    // Warn about large files in non-streaming mode
     if !args.stream
         && let Ok(meta) = std::fs::metadata(&args.input)
     {
@@ -560,8 +552,6 @@ fn main() -> Result<()> {
         }
     }
 
-    // In streaming plain-text mode, text was already printed progressively.
-    // Only call print_output for structured formats or non-streaming mode.
     let skip_print = args.stream && matches!(args.format, OutputFormat::Text) && !args.timestamps;
     if !skip_print {
         print_output(&args, &device, &result)?;

@@ -16,8 +16,6 @@ use crate::parakeet::tokenizer;
 
 pub type HiddenStates = Vec<Option<(Tensor, Tensor)>>;
 
-/// Compute entropy-based confidence from logits.
-/// Returns a value in [0, 1] where 1 means the model is maximally certain.
 fn confidence_from_logits(logits: &Tensor, vocab_size: usize) -> Result<f64> {
     let probs = softmax(logits, D::Minus1)?;
     let log_probs = (&probs + 1e-10)?.log()?;
@@ -27,8 +25,6 @@ fn confidence_from_logits(logits: &Tensor, vocab_size: usize) -> Result<f64> {
     Ok(1.0 - (entropy / max_entropy))
 }
 
-/// Compute entropy-based confidence from a span of probability frames (CTC).
-/// Averages per-frame entropy across the span.
 fn confidence_from_span(probs: &Tensor, vocab_size: usize) -> Result<f64> {
     let log_probs = (probs + 1e-10)?.log()?;
     let entropy = (probs * &log_probs)?.sum(D::Minus1)?.neg()?;
@@ -37,7 +33,6 @@ fn confidence_from_span(probs: &Tensor, vocab_size: usize) -> Result<f64> {
     Ok(1.0 - (avg_entropy / max_entropy))
 }
 
-/// Beam search hypothesis for RNNT/TDT decoding.
 #[derive(Clone)]
 struct Hypothesis {
     score: f64,
@@ -1380,9 +1375,7 @@ impl<'a> StreamingParakeet<'a> {
             return Ok(());
         }
 
-        // Combine carryover audio with new audio for consistent mel normalization.
-        // Computing mel from contiguous audio avoids normalization discontinuities
-        // that occur when independently-normalized mel chunks are concatenated.
+        // Normalize the carryover and new audio together to avoid a discontinuity at the chunk boundary.
         let mut full_audio = std::mem::take(&mut self.audio_carryover);
         full_audio.extend_from_slice(&self.audio_buffer[..usable]);
         self.audio_buffer.drain(0..usable);
@@ -1396,7 +1389,6 @@ impl<'a> StreamingParakeet<'a> {
         }
         let mel_in = mel.narrow(1, 0, usable_mel)?;
 
-        // Run encoder with cache
         let (features, lengths) = self
             .model
             .encoder_forward_with_cache(&mel_in, &mut self.cache)?;
@@ -1407,13 +1399,11 @@ impl<'a> StreamingParakeet<'a> {
             return Ok(());
         }
 
-        // Compute how much mel/audio to keep for the draft region + leftover
         let leftover_mel = total_mel - length * enc.subsampling_factor;
         let drop = (self.context_size.1 * self.depth).min(length);
         let keep_mel = drop * enc.subsampling_factor + leftover_mel;
 
-        // Keep raw audio corresponding to the carryover mel frames.
-        // Each mel frame starts at frame_index * hop, plus we need win_length context.
+        // Keep one extra analysis window to recompute the carryover mel frames.
         let keep_audio_start = full_audio
             .len()
             .saturating_sub(keep_mel * hop + pre.win_length());
@@ -1421,7 +1411,6 @@ impl<'a> StreamingParakeet<'a> {
 
         let finalized_length = length - drop;
 
-        // Decode finalized and draft tokens
         match &mut self.model {
             ParakeetModelRef::Tdt(model) => {
                 let (finalized, state) = model.decode(
@@ -1518,7 +1507,6 @@ impl<'a> StreamingParakeet<'a> {
         self.finalized_tokens.append(&mut self.draft_tokens);
     }
 
-    /// Returns the number of finalized tokens so far.
     pub fn finalized_count(&self) -> usize {
         self.finalized_tokens.len()
     }
@@ -1540,7 +1528,6 @@ mod tests {
 
     #[test]
     fn confidence_from_logits_uniform_distribution() {
-        // Uniform distribution => maximum entropy => confidence near 0
         let logits = Tensor::zeros((4,), DType::F32, &Device::Cpu).unwrap();
         let conf = confidence_from_logits(&logits, 4).unwrap();
         assert!(
@@ -1551,7 +1538,6 @@ mod tests {
 
     #[test]
     fn confidence_from_logits_peaked_distribution() {
-        // One-hot-like distribution => low entropy => confidence near 1
         let data = vec![-100.0f32, -100.0, 100.0, -100.0];
         let logits = Tensor::from_vec(data, (4,), &Device::Cpu).unwrap();
         let conf = confidence_from_logits(&logits, 4).unwrap();
@@ -1563,9 +1549,7 @@ mod tests {
 
     #[test]
     fn confidence_from_span_returns_valid_range() {
-        // 3 time steps, 4 classes - slightly peaked distribution
         let mut data = vec![0.1f32; 12];
-        // Make first class dominant in each frame
         for i in 0..3 {
             data[i * 4] = 0.7;
         }
@@ -1591,8 +1575,6 @@ mod tests {
             beam_size: 0,
             ..Beam::default()
         };
-        // We can't test decode_beam directly without a full model,
-        // but verify the constraint is documented in the type
         assert_eq!(beam.beam_size, 0);
     }
 

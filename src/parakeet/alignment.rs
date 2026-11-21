@@ -496,7 +496,6 @@ mod tests {
 
     #[test]
     fn merge_contiguous_with_overlap() {
-        // Tokens overlap in time, with matching IDs
         let a = vec![
             tok(0, " a", 0.0, 0.5),
             tok(1, " b", 0.5, 0.5),
@@ -533,18 +532,16 @@ mod tests {
 
     #[test]
     fn merge_contiguous_fails_falls_back_to_lcs() {
-        // Overlapping tokens where IDs don't form a contiguous match long
-        // enough to pass the threshold, forcing LCS fallback.
         let a = vec![
             tok(0, " a", 0.0, 0.5),
             tok(1, " b", 0.5, 0.5),
             tok(2, " c", 1.0, 0.5),
-            tok(99, " x", 1.5, 0.5), // divergent token
+            tok(99, " x", 1.5, 0.5),
             tok(3, " d", 2.0, 0.5),
         ];
         let b = vec![
             tok(2, " c", 1.0, 0.5),
-            tok(88, " y", 1.5, 0.5), // different divergent token
+            tok(88, " y", 1.5, 0.5),
             tok(3, " d", 2.0, 0.5),
             tok(4, " e", 2.5, 0.5),
         ];
@@ -552,9 +549,7 @@ mod tests {
         let contiguous_result = merge_longest_contiguous(&a, &b, 2.0);
         assert!(contiguous_result.is_err(), "contiguous should fail here");
 
-        // LCS fallback should produce a valid merge
         let lcs_result = merge_longest_common_subsequence(&a, &b, 2.0);
-        // Should contain tokens from both sides with IDs 2 and 3 as anchors
         let ids: Vec<usize> = lcs_result.iter().map(|t| t.id).collect();
         assert!(ids.contains(&0), "should have token 0 from a");
         assert!(ids.contains(&4), "should have token 4 from b");
@@ -568,7 +563,6 @@ mod tests {
         let a = vec![tok(0, " a", 0.0, 0.5), tok(1, " b", 0.5, 0.5)];
         let b = vec![tok(2, " c", 0.8, 0.5), tok(3, " d", 1.5, 0.5)];
         let result = merge_longest_contiguous(&a, &b, 0.1).unwrap();
-        // Should have tokens from both sides separated at cutoff
         assert!(!result.is_empty());
     }
 
