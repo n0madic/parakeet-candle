@@ -442,59 +442,31 @@ fn mel_to_hz(mel: f64) -> f64 {
     }
 }
 
+/// Slaney-normalised triangular mel filters, computed like
+/// `librosa.filters.mel(norm="slaney", htk=False)`, which NeMo and
+/// parakeet-mlx use. Triangle edges sit at exact mel frequencies rather than
+/// rounded FFT bins, so narrow low-frequency filters still overlap a bin.
 fn mel_filterbank(sr: usize, n_fft: usize, n_mels: usize) -> Vec<f32> {
     let fmin = 0.0;
     let fmax = sr as f64 / 2.0;
     let mel_min = hz_to_mel(fmin);
     let mel_max = hz_to_mel(fmax);
-
-    let mut mel_points = Vec::with_capacity(n_mels + 2);
-    for i in 0..(n_mels + 2) {
-        let t = i as f64 / (n_mels + 1) as f64;
-        mel_points.push(mel_min + (mel_max - mel_min) * t);
-    }
-
-    let hz_points: Vec<f64> = mel_points.into_iter().map(mel_to_hz).collect();
-    let bins: Vec<usize> = hz_points
-        .iter()
-        .map(|&hz| ((n_fft + 1) as f64 * hz / sr as f64).floor() as usize)
+    let hz_points: Vec<f64> = (0..n_mels + 2)
+        .map(|i| mel_to_hz(mel_min + (mel_max - mel_min) * i as f64 / (n_mels + 1) as f64))
         .collect();
 
     let n_fft_bins = n_fft / 2 + 1;
     let mut filters = vec![0f32; n_mels * n_fft_bins];
     for m in 0..n_mels {
-        let f_m_minus = bins[m];
-        let f_m = bins[m + 1];
-        let f_m_plus = bins[m + 2];
-
-        if f_m_minus == f_m || f_m == f_m_plus {
-            continue;
-        }
-
-        for k in f_m_minus..f_m {
-            if k < n_fft_bins {
-                filters[m * n_fft_bins + k] =
-                    (k as f64 - f_m_minus as f64) as f32 / (f_m as f64 - f_m_minus as f64) as f32;
-            }
-        }
-        for k in f_m..f_m_plus {
-            if k < n_fft_bins {
-                filters[m * n_fft_bins + k] =
-                    (f_m_plus as f64 - k as f64) as f32 / (f_m_plus as f64 - f_m as f64) as f32;
-            }
-        }
-    }
-
-    // Slaney-style normalization
-    for m in 0..n_mels {
-        let f_m_minus = hz_points[m];
-        let f_m_plus = hz_points[m + 2];
-        let enorm = 2.0 / (f_m_plus - f_m_minus).max(1e-6);
+        let (left, center, right) = (hz_points[m], hz_points[m + 1], hz_points[m + 2]);
+        let enorm = 2.0 / (right - left);
         for k in 0..n_fft_bins {
-            filters[m * n_fft_bins + k] *= enorm as f32;
+            let freq = k as f64 * sr as f64 / n_fft as f64;
+            let lower = (freq - left) / (center - left);
+            let upper = (right - freq) / (right - center);
+            filters[m * n_fft_bins + k] = (lower.min(upper).max(0.0) * enorm) as f32;
         }
     }
-
     filters
 }
 
@@ -727,6 +699,17 @@ mod tests {
         let filters = mel_filterbank(16000, 512, 80);
         for &v in &filters {
             assert!(v >= 0.0, "filter value = {v}");
+        }
+    }
+
+    /// With 128 mels on a 512-point FFT (parakeet-tdt-0.6b-v3), the lowest
+    /// filters are narrower than one FFT bin. Each must still have weight.
+    #[test]
+    fn mel_filterbank_has_no_empty_filters() {
+        let n_bins = 512 / 2 + 1;
+        let filters = mel_filterbank(16000, 512, 128);
+        for (m, filter) in filters.chunks(n_bins).enumerate() {
+            assert!(filter.iter().any(|&v| v > 0.0), "mel filter {m} is empty");
         }
     }
 
