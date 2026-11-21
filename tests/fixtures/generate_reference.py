@@ -30,6 +30,7 @@ tests/fixtures/README.md for the source URL and checksum.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 import tempfile
@@ -52,15 +53,19 @@ MODEL_ID = "mlx-community/parakeet-tdt-0.6b-v3"
 MODEL_REVISION = "ed2b7e8c15f9aaa0b5772e2efb986255eaef7e15"
 CLIP_SECONDS = 7.0
 SOURCE_MP3_SHA256 = "6cb289fa9a13cfc94b18e8a89159da687c60db88c2b6377311f9bc5664d5492f"
+# SHA-256 of the clip's samples as little-endian int16. FFmpeg n9.0.2 produced
+# them; another FFmpeg build may decode or resample differently.
+CLIP_PCM_SHA256 = "5f9c6ea6f9adf82a579b5a6cdcf08ffc68569280b490482905cee218f92abeab"
 
 # Encoder frames whose full 1024-d vectors are stored verbatim.
 ENCODER_ROW_FRAMES = [0, 1, 10, 25, 44, 60, 80, 87]
 
 # Streaming configurations replayed by tests/reference_parity.rs:
 # (left context, right context) in encoder frames, depth, chunk seconds.
-# (256, 256) is the parakeet-mlx default. (64, 16) keeps more frames than the
-# left context fits, so the rotating KV cache wraps within the 7 s clip.
-STREAM_CONFIGS = [((256, 256), 1, 0.5), ((64, 16), 1, 0.5)]
+# (256, 256) is the parakeet-mlx default; nothing is committed on this clip.
+# (128, 16) commits frames but its left context covers all 88 encoder frames,
+# so the rotating KV cache never wraps. (64, 16) wraps within the 7 s clip.
+STREAM_CONFIGS = [((256, 256), 1, 0.5), ((128, 16), 1, 0.5), ((64, 16), 1, 0.5)]
 BEAM_SIZE = 5
 
 FIXTURE_DIR = Path(__file__).resolve().parent / "reference"
@@ -90,8 +95,6 @@ def get_logmel(x: mx.array, args) -> mx.array:
 
 def make_clip(source_mp3: Path) -> None:
     """Decode, downmix, resample, and trim the LibriVox MP3 to 16 kHz s16."""
-    import hashlib
-
     digest = hashlib.sha256(source_mp3.read_bytes()).hexdigest()
     if digest != SOURCE_MP3_SHA256:
         raise SystemExit(f"unexpected source checksum {digest}")
@@ -107,7 +110,13 @@ def make_clip(source_mp3: Path) -> None:
             ],
             check=True,
         )
-        samples, sr = sf.read(wav, dtype="int16")
+        samples, sr = sf.read(wav, dtype="<i2")
+    digest = hashlib.sha256(samples.tobytes()).hexdigest()
+    if digest != CLIP_PCM_SHA256:
+        raise SystemExit(
+            f"decoded clip has PCM checksum {digest}, expected {CLIP_PCM_SHA256}; "
+            "this FFmpeg build decodes or resamples differently from n9.0.2"
+        )
     # libsndfile's FLAC encoder compresses this clip about 2x better than ffmpeg's.
     sf.write(CLIP_PATH, samples, sr, subtype="PCM_16")
 
@@ -206,7 +215,8 @@ def main() -> None:
     assert pre.window == "hann" and pre.normalize == "per_feature" and pre.pad_to == 0
     parakeet_mlx.parakeet.get_logmel = get_logmel
 
-    audio_i16, sr = sf.read(CLIP_PATH, dtype="int16")
+    audio_i16, sr = sf.read(CLIP_PATH, dtype="<i2")
+    assert hashlib.sha256(audio_i16.tobytes()).hexdigest() == CLIP_PCM_SHA256
     assert sr == pre.sample_rate, (sr, pre.sample_rate)
     audio = (audio_i16.astype(np.float32) / 32768.0).astype(np.float32)
     audio_mx = mx.array(audio)
@@ -275,7 +285,8 @@ def main() -> None:
         "versions": {
             pkg: version(pkg)
             for pkg in ["parakeet-mlx", "mlx", "mlx-cpu", "numpy", "librosa", "soundfile"]
-        },
+        }
+        | {"libsndfile": sf.__libsndfile_version__},
         "model_id": MODEL_ID,
         "model_revision": MODEL_REVISION,
         "dtype": "float32",

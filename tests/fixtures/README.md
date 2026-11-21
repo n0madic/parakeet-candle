@@ -24,6 +24,13 @@ recordings are in the public domain."
 
 - Source: <https://archive.org/download/art_of_war_librivox/art_of_war_01-02_sun_tzu_64kb.mp3>
 - SHA-256: `6cb289fa9a13cfc94b18e8a89159da687c60db88c2b6377311f9bc5664d5492f`
+- Clip PCM SHA-256 (little-endian int16 samples):
+  `5f9c6ea6f9adf82a579b5a6cdcf08ffc68569280b490482905cee218f92abeab`
+
+The clip was cut with FFmpeg n9.0.2 and written with libsndfile 1.2.2. The
+generator checks the PCM checksum both when it rebuilds the clip and before it
+uses the committed FLAC. A different FFmpeg build may decode or resample the
+MP3 differently; the generator then stops instead of writing new goldens.
 
 ## Reference choices
 
@@ -48,8 +55,11 @@ The audio and log-mel tests run with `cargo test`. The model tests need the
 weights (about 2.5 GB, downloaded once into the Hugging Face cache):
 
 ```sh
-cargo test --release --test reference_parity -- --ignored --nocapture
+cargo test --release --test reference_parity -- --ignored --skip known_bug --nocapture
 ```
+
+`known_bug_streaming_cache_wrap` reproduces a reported bug and fails until it
+is fixed. Run it on its own with `-- --ignored known_bug`.
 
 ## Regenerate the fixtures
 

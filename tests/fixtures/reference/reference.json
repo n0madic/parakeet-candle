@@ -6,7 +6,8 @@
     "mlx-cpu": "0.32.4",
     "numpy": "2.5.5",
     "librosa": "1.0.1",
-    "soundfile": "0.14.0"
+    "soundfile": "0.14.0",
+    "libsndfile": "1.2.2"
   },
   "model_id": "mlx-community/parakeet-tdt-0.6b-v3",
   "model_revision": "ed2b7e8c15f9aaa0b5772e2efb986255eaef7e15",
@@ -871,6 +872,143 @@
           "start": 6.8,
           "duration": 0.08,
           "confidence": 0.9908716678619385
+        }
+      ]
+    },
+    {
+      "context_size": [
+        128,
+        16
+      ],
+      "depth": 1,
+      "chunk_seconds": 0.5,
+      "text": "This is a Librix recording. In the public domain.",
+      "tokens": [
+        {
+          "id": 5831,
+          "text": " This",
+          "start": 0.0,
+          "duration": 0.24,
+          "confidence": 0.9055222868919373
+        },
+        {
+          "id": 439,
+          "text": " L",
+          "start": 0.0,
+          "duration": 0.08,
+          "confidence": 0.8302555084228516
+        },
+        {
+          "id": 7883,
+          "text": ".",
+          "start": 0.0,
+          "duration": 0.08,
+          "confidence": 0.886470377445221
+        },
+        {
+          "id": 973,
+          "text": "ib",
+          "start": 0.08,
+          "duration": 0.08,
+          "confidence": 0.9931229948997498
+        },
+        {
+          "id": 508,
+          "text": " is",
+          "start": 0.24,
+          "duration": 0.16,
+          "confidence": 0.920947253704071
+        },
+        {
+          "id": 7950,
+          "text": "x",
+          "start": 0.24,
+          "duration": 0.08,
+          "confidence": 0.890413224697113
+        },
+        {
+          "id": 381,
+          "text": "ing",
+          "start": 0.24,
+          "duration": 0.16,
+          "confidence": 0.9903512001037598
+        },
+        {
+          "id": 330,
+          "text": "ri",
+          "start": 0.32,
+          "duration": 0.08,
+          "confidence": 0.9185901284217834
+        },
+        {
+          "id": 1875,
+          "text": " rec",
+          "start": 0.32,
+          "duration": 0.08,
+          "confidence": 0.875054657459259
+        },
+        {
+          "id": 279,
+          "text": " a",
+          "start": 0.4,
+          "duration": 0.16,
+          "confidence": 0.9806447625160217
+        },
+        {
+          "id": 711,
+          "text": "ord",
+          "start": 0.4,
+          "duration": 0.16,
+          "confidence": 0.9312535524368286
+        },
+        {
+          "id": 892,
+          "text": " In",
+          "start": 0.0,
+          "duration": 0.08,
+          "confidence": 0.8911244869232178
+        },
+        {
+          "id": 506,
+          "text": " the",
+          "start": 0.16,
+          "duration": 0.16,
+          "confidence": 0.997485339641571
+        },
+        {
+          "id": 1306,
+          "text": " dom",
+          "start": 0.16,
+          "duration": 0.16,
+          "confidence": 0.9967074990272522
+        },
+        {
+          "id": 6371,
+          "text": " public",
+          "start": 0.32,
+          "duration": 0.32,
+          "confidence": 0.9982941746711731
+        },
+        {
+          "id": 7865,
+          "text": "a",
+          "start": 0.32,
+          "duration": 0.24,
+          "confidence": 0.9999355673789978
+        },
+        {
+          "id": 281,
+          "text": "in",
+          "start": 0.56,
+          "duration": 0.16,
+          "confidence": 0.9999542236328125
+        },
+        {
+          "id": 7883,
+          "text": ".",
+          "start": 0.72,
+          "duration": 0.16,
+          "confidence": 0.9226462841033936
         }
       ]
     },
