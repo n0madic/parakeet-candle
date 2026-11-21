@@ -121,7 +121,7 @@ impl RotatingConformerCache {
         let drop = self.cache_drop_size.min(s);
         let to_cache = s.saturating_sub(drop).min(self.capacity);
 
-        // Save previous cache state before mutation for building output
+        // Return the previous context even if this update evicts part of it.
         let prev_keys = self.keys.clone();
         let prev_values = self.values.clone();
 
@@ -163,7 +163,6 @@ impl RotatingConformerCache {
         self.values = Some(new_kv.1);
         self.offset += to_cache;
 
-        // Output: previous cache (before this update) + current input keys
         let k_out = if let Some(k) = &prev_keys {
             Tensor::cat(&[k, &keys], 2)?
         } else {

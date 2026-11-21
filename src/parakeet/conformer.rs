@@ -45,10 +45,7 @@ fn default_subsampling_conv_chunking_factor() -> isize {
     1
 }
 
-/// Try to load a tensor from a VarBuilder, returning None if the tensor is not
-/// found. Unlike matching on error message strings, this treats any load
-/// failure for the specific tensor as "not present" -- the caller is expected
-/// to have a fallback path.
+// Treat any load error as a missing tensor so callers can try a fallback.
 fn try_get_tensor<S: Into<candle::Shape>>(vb: &VarBuilder, shape: S, name: &str) -> Option<Tensor> {
     vb.get(shape, name).ok()
 }

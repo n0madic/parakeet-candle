@@ -1,13 +1,15 @@
+use audioadapter_buffers::direct::InterleavedSlice;
 use candle::{DType, Device, Result, Tensor};
 use rubato::{
-    Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+    Async, FixedAsync, Indexing, Resampler, SincInterpolationParameters, SincInterpolationType,
+    WindowFunction,
 };
-use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
+use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions, CODEC_ID_NULL_AUDIO};
+use symphonia::core::errors::Error as DecodeError;
+use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, FormatReader};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct PreprocessArgs {
@@ -46,7 +48,6 @@ impl PreprocessArgs {
         (self.window_stride * self.sample_rate as f64) as usize
     }
 
-    /// Validate that all fields have sensible values.
     /// Call after deserialization to catch invalid configs early.
     pub fn validate(&self) -> Result<()> {
         if self.sample_rate == 0 {
@@ -71,134 +72,35 @@ impl PreprocessArgs {
 }
 
 pub fn load_audio(path: &std::path::Path, sampling_rate: usize) -> Result<Vec<f32>> {
-    if !path.exists() {
-        return Err(candle::Error::Msg(format!(
-            "audio file not found: {}",
-            path.display()
-        )));
+    let mut reader = AudioReader::open(path, sampling_rate)?;
+    let mut audio = Vec::new();
+    while !reader.is_finished() {
+        audio.extend(reader.read_chunk(16_384)?);
     }
 
-    let file = std::fs::File::open(path)
-        .map_err(|e| candle::Error::Msg(format!("failed to open audio file: {e}")))?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
-
-    let mut hint = Hint::new();
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        hint.with_extension(ext);
-    }
-
-    let probed = symphonia::default::get_probe()
-        .format(
-            &hint,
-            mss,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
-        )
-        .map_err(|e| candle::Error::Msg(format!("unsupported audio format: {e}")))?;
-    let mut reader = probed.format;
-
-    let track = reader
-        .tracks()
-        .iter()
-        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
-        .ok_or_else(|| candle::Error::Msg("no audio track found".to_string()))?;
-    let track_id = track.id;
-    let source_sr = track
-        .codec_params
-        .sample_rate
-        .ok_or_else(|| candle::Error::Msg("unknown sample rate".to_string()))?
-        as usize;
-    let channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(1);
-    let codec_params = track.codec_params.clone();
-
-    let mut decoder = symphonia::default::get_codecs()
-        .make(&codec_params, &DecoderOptions::default())
-        .map_err(|e| candle::Error::Msg(format!("unsupported codec: {e}")))?;
-
-    let mut raw_samples: Vec<f32> = Vec::new();
-    let mut sample_buf: Option<SampleBuffer<f32>> = None;
-    loop {
-        let packet = match reader.next_packet() {
-            Ok(packet) => packet,
-            Err(symphonia::core::errors::Error::IoError(ref e))
-                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
-                break;
-            }
-            Err(e) => return Err(candle::Error::Msg(format!("decode error: {e}"))),
-        };
-        if packet.track_id() != track_id {
-            continue;
-        }
-        let decoded = match decoder.decode(&packet) {
-            Ok(d) => d,
-            Err(symphonia::core::errors::Error::IoError(_))
-            | Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
-            Err(e) => return Err(candle::Error::Msg(format!("decode error: {e}"))),
-        };
-        let spec = *decoded.spec();
-        let duration = decoded.capacity() as u64;
-        let buf = sample_buf.get_or_insert_with(|| SampleBuffer::<f32>::new(duration, spec));
-        buf.copy_interleaved_ref(decoded);
-        raw_samples.extend_from_slice(buf.samples());
-    }
-
-    if raw_samples.is_empty() {
+    if audio.is_empty() {
         return Err(candle::Error::Msg("no audio samples decoded".to_string()));
     }
-
-    // Convert to mono by averaging channels
-    let mono = if channels <= 1 {
-        raw_samples
-    } else {
-        raw_samples
-            .chunks_exact(channels)
-            .map(|frame| frame.iter().sum::<f32>() / channels as f32)
-            .collect()
-    };
-
-    // Skip resampling if already at target rate
-    if source_sr == sampling_rate {
-        return Ok(mono);
-    }
-
-    // Sinc resampling via rubato
-    let mut resampler = sinc_resampler(source_sr, sampling_rate).map_err(candle::Error::Msg)?;
-
-    let mut output =
-        Vec::with_capacity(mono.len() * sampling_rate / source_sr + RESAMPLE_CHUNK_SIZE);
-    for chunk in mono.chunks(RESAMPLE_CHUNK_SIZE) {
-        let result = if chunk.len() == RESAMPLE_CHUNK_SIZE {
-            resampler.process(&[chunk], None)
-        } else {
-            resampler.process_partial(Some(&[chunk]), None)
-        };
-        let waves = result.map_err(|e| candle::Error::Msg(format!("resampling failed: {e}")))?;
-        output.extend_from_slice(&waves[0]);
-    }
-
-    Ok(output)
+    Ok(audio)
 }
 
 const RESAMPLE_CHUNK_SIZE: usize = 1024;
 
-fn sinc_resampler(
-    source_sr: usize,
-    target_sr: usize,
-) -> std::result::Result<SincFixedIn<f32>, String> {
+fn sinc_resampler(source_sr: usize, target_sr: usize) -> std::result::Result<Async<f32>, String> {
     let params = SincInterpolationParameters {
         sinc_len: 256,
-        f_cutoff: 0.95,
+        f_cutoff: Some(0.95),
         interpolation: SincInterpolationType::Linear,
         oversampling_factor: 256,
         window: WindowFunction::BlackmanHarris2,
     };
-    SincFixedIn::<f32>::new(
+    Async::new_sinc(
         target_sr as f64 / source_sr as f64,
         2.0,
-        params,
+        &params,
         RESAMPLE_CHUNK_SIZE,
         1,
+        FixedAsync::Input,
     )
     .map_err(|e| format!("resampler creation failed: {e}"))
 }
@@ -207,20 +109,19 @@ fn sinc_resampler(
 /// without loading the entire file into memory.
 pub struct AudioReader {
     reader: Box<dyn FormatReader>,
-    decoder: Box<dyn symphonia::core::codecs::Decoder>,
+    decoder: Box<dyn AudioDecoder>,
     track_id: u32,
-    channels: usize,
     target_sr: usize,
-    resampler: Option<SincFixedIn<f32>>,
+    resampler: Option<Async<f32>>,
+    resample_delay: usize,
     mono_buffer: Vec<f32>,
     output_buffer: Vec<f32>,
-    sample_buf: Option<SampleBuffer<f32>>,
+    sample_buf: Vec<f32>,
     finished: bool,
     total_samples_read: usize,
 }
 
 impl AudioReader {
-    /// Open an audio file for incremental reading at the given target sample rate.
     pub fn open(path: &std::path::Path, target_sr: usize) -> Result<Self> {
         if !path.exists() {
             return Err(candle::Error::Msg(format!(
@@ -238,32 +139,28 @@ impl AudioReader {
             hint.with_extension(ext);
         }
 
-        let probed = symphonia::default::get_probe()
-            .format(
+        let reader = symphonia::default::get_probe()
+            .probe(
                 &hint,
                 mss,
-                &FormatOptions::default(),
-                &MetadataOptions::default(),
+                FormatOptions::default(),
+                MetadataOptions::default(),
             )
             .map_err(|e| candle::Error::Msg(format!("unsupported audio format: {e}")))?;
-        let reader = probed.format;
 
-        let track = reader
+        let (track_id, codec_params) = reader
             .tracks()
             .iter()
-            .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+            .filter_map(|track| Some((track.id, track.codec_params.as_ref()?.audio()?)))
+            .find(|(_, params)| params.codec != CODEC_ID_NULL_AUDIO)
             .ok_or_else(|| candle::Error::Msg("no audio track found".to_string()))?;
-        let track_id = track.id;
-        let source_sr = track
-            .codec_params
+        let source_sr = codec_params
             .sample_rate
             .ok_or_else(|| candle::Error::Msg("unknown sample rate".to_string()))?
             as usize;
-        let channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(1);
-        let codec_params = track.codec_params.clone();
 
         let decoder = symphonia::default::get_codecs()
-            .make(&codec_params, &DecoderOptions::default())
+            .make_audio_decoder(codec_params, &AudioDecoderOptions::default())
             .map_err(|e| candle::Error::Msg(format!("unsupported codec: {e}")))?;
 
         let resampler = if source_sr != target_sr {
@@ -271,17 +168,18 @@ impl AudioReader {
         } else {
             None
         };
+        let resample_delay = resampler.as_ref().map_or(0, Resampler::output_delay);
 
         Ok(Self {
             reader,
             decoder,
             track_id,
-            channels,
             target_sr,
             resampler,
+            resample_delay,
             mono_buffer: Vec::new(),
             output_buffer: Vec::new(),
-            sample_buf: None,
+            sample_buf: Vec::new(),
             finished: false,
             total_samples_read: 0,
         })
@@ -301,7 +199,6 @@ impl AudioReader {
         Ok(chunk)
     }
 
-    /// Returns `true` when all audio has been consumed and output buffer is empty.
     pub fn is_finished(&self) -> bool {
         self.finished && self.output_buffer.is_empty()
     }
@@ -313,41 +210,32 @@ impl AudioReader {
 
     fn decode_next_packet(&mut self) -> Result<()> {
         let packet = match self.reader.next_packet() {
-            Ok(packet) => packet,
-            Err(symphonia::core::errors::Error::IoError(ref e))
-                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
-                // End of file: flush resampler
+            Ok(Some(packet)) => packet,
+            Ok(None) => {
                 self.resample_buffered(true)?;
                 self.finished = true;
                 return Ok(());
             }
             Err(e) => return Err(candle::Error::Msg(format!("decode error: {e}"))),
         };
-        if packet.track_id() != self.track_id {
+        if packet.track_id != self.track_id {
             return Ok(());
         }
         let decoded = match self.decoder.decode(&packet) {
-            Ok(d) => d,
-            Err(symphonia::core::errors::Error::IoError(_))
-            | Err(symphonia::core::errors::Error::DecodeError(_)) => return Ok(()),
+            Ok(decoded) => decoded,
+            Err(DecodeError::IoError(_) | DecodeError::DecodeError(_)) => return Ok(()),
             Err(e) => return Err(candle::Error::Msg(format!("decode error: {e}"))),
         };
-        let spec = *decoded.spec();
-        let duration = decoded.capacity() as u64;
-        let buf = self
-            .sample_buf
-            .get_or_insert_with(|| SampleBuffer::<f32>::new(duration, spec));
-        buf.copy_interleaved_ref(decoded);
-        let raw = buf.samples();
+        decoded.copy_to_vec_interleaved(&mut self.sample_buf);
+        let channels = decoded.spec().channels().count();
 
-        // Convert to mono
-        if self.channels <= 1 {
-            self.mono_buffer.extend_from_slice(raw);
+        if channels == 1 {
+            self.mono_buffer.extend_from_slice(&self.sample_buf);
         } else {
             self.mono_buffer.extend(
-                raw.chunks_exact(self.channels)
-                    .map(|frame| frame.iter().sum::<f32>() / self.channels as f32),
+                self.sample_buf
+                    .chunks_exact(channels)
+                    .map(|frame| frame.iter().sum::<f32>() / channels as f32),
             );
         }
 
@@ -356,27 +244,28 @@ impl AudioReader {
 
     fn resample_buffered(&mut self, flush: bool) -> Result<()> {
         let Some(resampler) = &mut self.resampler else {
-            // No resampling needed: move mono directly to output
             self.output_buffer.append(&mut self.mono_buffer);
             return Ok(());
         };
 
-        // Process complete chunks
-        while self.mono_buffer.len() >= RESAMPLE_CHUNK_SIZE {
-            let chunk: Vec<f32> = self.mono_buffer.drain(..RESAMPLE_CHUNK_SIZE).collect();
-            let waves = resampler
-                .process(&[&chunk], None)
-                .map_err(|e| candle::Error::Msg(format!("resampling failed: {e}")))?;
-            self.output_buffer.extend_from_slice(&waves[0]);
-        }
-
-        // Flush remaining partial chunk at end of file
-        if flush && !self.mono_buffer.is_empty() {
-            let remaining: Vec<f32> = self.mono_buffer.drain(..).collect();
-            let waves = resampler
-                .process_partial(Some(&[&remaining]), None)
-                .map_err(|e| candle::Error::Msg(format!("resampling failed: {e}")))?;
-            self.output_buffer.extend_from_slice(&waves[0]);
+        let input_frames = resampler.input_frames_next();
+        while self.mono_buffer.len() >= input_frames || (flush && !self.mono_buffer.is_empty()) {
+            let frames = self.mono_buffer.len().min(input_frames);
+            let input =
+                InterleavedSlice::new(&self.mono_buffer, 1, frames).map_err(candle::Error::wrap)?;
+            let indexing = Indexing {
+                partial_len: (frames < input_frames).then_some(frames),
+                ..Default::default()
+            };
+            let output = resampler
+                .process(&input, Some(&indexing))
+                .map_err(|e| candle::Error::Msg(format!("resampling failed: {e}")))?
+                .take_data();
+            // Keep transcript timestamps aligned with the input audio.
+            let skip = self.resample_delay.min(output.len());
+            self.output_buffer.extend_from_slice(&output[skip..]);
+            self.resample_delay -= skip;
+            self.mono_buffer.drain(..frames);
         }
 
         Ok(())
@@ -682,13 +571,10 @@ mod tests {
 
     #[test]
     fn fft_dc_signal() {
-        // FFT of a constant signal should have all energy in bin 0.
         let signal = vec![1.0f32; 8];
         let result = fft(&signal);
-        // Bin 0: real = 8.0, imag = 0.0
         assert!((result[0] - 8.0).abs() < 1e-5);
         assert!(result[1].abs() < 1e-5);
-        // All other bins should be zero
         for i in 1..8 {
             assert!(result[2 * i].abs() < 1e-4, "bin {i} re = {}", result[2 * i]);
             assert!(
@@ -707,25 +593,19 @@ mod tests {
             .map(|i| (2.0 * std::f32::consts::PI * i as f32 / n as f32).cos())
             .collect();
         let result = fft(&signal);
-        // Bin 1 should have magnitude N/2 = 4
         let mag_bin1 = (result[2] * result[2] + result[3] * result[3]).sqrt();
         assert!(
             (mag_bin1 - 4.0).abs() < 1e-3,
             "bin 1 magnitude = {mag_bin1}"
         );
-        // Bin 0 should be ~0
         assert!(result[0].abs() < 1e-3, "bin 0 = {}", result[0]);
     }
 
     #[test]
     fn fft_odd_length_zero_padded() {
-        // Non-power-of-2 is zero-padded to next power of 2
         let signal = vec![1.0, 2.0, 3.0];
         let result = fft(&signal);
-        // Padded to length 4: [1, 2, 3, 0]
-        // X[0] = 1+2+3+0 = 6
         assert!((result[0] - 6.0).abs() < 1e-4);
-        // Output has 4 complex values (8 floats)
         assert_eq!(result.len(), 8);
     }
 
@@ -768,12 +648,9 @@ mod tests {
     fn reflect_pad_basic() {
         let samples = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let padded = reflect_pad(&samples, 2);
-        // Left reflection of [1..=2] reversed = [3, 2]
         assert_eq!(padded[0], 3.0);
         assert_eq!(padded[1], 2.0);
-        // Original
         assert_eq!(&padded[2..7], &[1.0, 2.0, 3.0, 4.0, 5.0]);
-        // Right reflection of [3..4] reversed = [4, 3]
         assert_eq!(padded[7], 4.0);
         assert_eq!(padded[8], 3.0);
     }
@@ -863,7 +740,6 @@ mod tests {
             preemph: Some(0.97),
             mag_power: 2.0,
         };
-        // 1 second of silence
         let audio = vec![0.0f32; sr];
         let device = Device::Cpu;
         let mel = get_logmel(&audio, &args, &device).unwrap();
