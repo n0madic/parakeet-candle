@@ -1,6 +1,6 @@
 # parakeet-candle
 
-Transcribe audio locally with NVIDIA Parakeet models in Rust using [Candle](https://github.com/huggingface/candle). Supports TDT, RNNT, CTC, and hybrid TDT-CTC models and reads WAV, MP3, FLAC, Ogg Vorbis, and AAC (ADTS `.aac` or MP4/M4A) audio.
+Transcribe audio locally with NVIDIA Parakeet models in Rust using [Candle](https://github.com/huggingface/candle). Supports TDT, RNNT, CTC, and hybrid TDT-CTC models and reads WAV, MP3, FLAC, Ogg Vorbis, and mono or stereo AAC-LC (ADTS `.aac`, `.m4a`, or `.mp4`) audio.
 
 ## Run
 
