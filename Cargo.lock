@@ -2464,6 +2464,7 @@ dependencies = [
  "clap",
  "hf-hub",
  "intel-mkl-src",
+ "realfft",
  "rubato",
  "serde",
  "serde_json",
