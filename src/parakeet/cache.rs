@@ -70,8 +70,9 @@ impl ConformerCache {
         };
 
         self.conv = Some(new_cache.clone());
-        // Causal: prepend cached left context, no right-padding
-        let result = Tensor::cat(&[&new_cache, x], 1)?;
+        // Prepend the cached left context and zero-pad the right, like the
+        // symmetric padding of the non-streaming path.
+        let result = Tensor::cat(&[&new_cache, x], 1)?.pad_with_zeros(1, 0, padding)?;
         Ok(result)
     }
 }
@@ -205,8 +206,9 @@ impl RotatingConformerCache {
         }
 
         self.conv = Some(new_cache.clone());
-        // Causal: prepend cached left context, no right-padding
-        let result = Tensor::cat(&[&new_cache, x], 1)?;
+        // Prepend the cached left context and zero-pad the right, like the
+        // symmetric padding of the non-streaming path.
+        let result = Tensor::cat(&[&new_cache, x], 1)?.pad_with_zeros(1, 0, padding)?;
         Ok(result)
     }
 }

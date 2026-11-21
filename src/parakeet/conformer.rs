@@ -95,7 +95,6 @@ struct Convolution {
     batch_norm: BatchNorm,
     pointwise_conv2: Conv1d,
     padding: usize,
-    causal_padding: usize,
 }
 
 impl Convolution {
@@ -156,15 +155,12 @@ impl Convolution {
         let pw2_b = try_get_tensor(&vb, (args.d_model,), "pointwise_conv2.bias");
         let pointwise_conv2 = Conv1d::new(pw2_w, pw2_b, cfg_pw);
 
-        let causal_padding = args.conv_kernel_size - 1;
-
         Ok(Self {
             pointwise_conv1,
             depthwise_conv,
             batch_norm,
             pointwise_conv2,
             padding,
-            causal_padding,
         })
     }
 
@@ -180,7 +176,7 @@ impl Convolution {
         let mut x = (&a * &gate)?;
 
         if let Some(cache) = cache {
-            x = cache.update_and_fetch_conv(&x, self.causal_padding)?;
+            x = cache.update_and_fetch_conv(&x, self.padding)?;
         } else if self.padding > 0 {
             x = x.pad_with_zeros(D::Minus2, self.padding, self.padding)?;
         }
