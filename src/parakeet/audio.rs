@@ -95,12 +95,13 @@ pub fn load_audio(path: &std::path::Path, sampling_rate: usize) -> Result<Vec<f3
 
 const RESAMPLE_CHUNK_SIZE: usize = 1024;
 
-/// Minimum FFT output block, in frames. rubato's FFT resampler builds its
-/// anti-aliasing filter on this block, so a short block rolls off well below
-/// Nyquist. 512 frames keeps the response flat to 7.5 kHz at a 16 kHz target
-/// for every input rate tested from 22.05 to 192 kHz, which covers the top of
+/// Minimum FFT block on each side, in frames. rubato's FFT resampler builds
+/// its anti-aliasing filter on the smaller block (the output when
+/// downsampling, the input when upsampling), so a short block rolls off well
+/// below Nyquist. 512 frames keeps the response flat to 94% of the lower
+/// Nyquist frequency: 7.5 kHz at a 16 kHz target, which covers the top of
 /// Parakeet's mel filterbank.
-const MIN_FFT_OUTPUT_BLOCK: usize = 512;
+const MIN_FFT_BLOCK: usize = 512;
 
 /// Largest FFT block allowed on either side. Rate pairs with no useful common
 /// divisor (for example 44,101 Hz) would need huge blocks, so they use sinc
@@ -112,12 +113,15 @@ fn gcd(a: usize, b: usize) -> usize {
 }
 
 /// FFT block sizes `(input, output)` for a rate pair, or `None` if the pair
-/// needs blocks larger than [`MAX_FFT_BLOCK`]. Both sizes are even, since an
-/// odd block makes rubato's reported delay off by a fraction of a sample.
+/// needs blocks larger than [`MAX_FFT_BLOCK`]. Both sizes are at least
+/// [`MIN_FFT_BLOCK`] and even, since an odd block makes rubato's reported
+/// delay off by a fraction of a sample. Rates must be non-zero.
 fn fft_block_sizes(source_sr: usize, target_sr: usize) -> Option<(usize, usize)> {
     let g = gcd(source_sr, target_sr);
     let (min_in, min_out) = (source_sr / g, target_sr / g);
-    let mut blocks = MIN_FFT_OUTPUT_BLOCK.div_ceil(min_out);
+    let mut blocks = MIN_FFT_BLOCK
+        .div_ceil(min_in)
+        .max(MIN_FFT_BLOCK.div_ceil(min_out));
     if (blocks * min_in) % 2 == 1 || (blocks * min_out) % 2 == 1 {
         blocks *= 2;
     }
@@ -129,6 +133,11 @@ fn make_resampler(
     source_sr: usize,
     target_sr: usize,
 ) -> std::result::Result<Box<dyn Resampler<f32>>, String> {
+    if source_sr == 0 || target_sr == 0 {
+        return Err(format!(
+            "invalid sample rates: {source_sr} Hz -> {target_sr} Hz"
+        ));
+    }
     let resampler: Box<dyn Resampler<f32>> = match fft_block_sizes(source_sr, target_sr) {
         // One sub-chunk of exactly `fft_in` frames makes rubato use these sizes.
         Some((fft_in, _)) => Box::new(
@@ -920,12 +929,84 @@ mod tests {
     }
 
     #[test]
+    fn fft_resampler_upsampling_passband() {
+        // Up to 90% of the input Nyquist frequency must pass unchanged.
+        for src in [1000, 4000, 8000, 11025] {
+            assert!(
+                fft_block_sizes(src, 16000).is_some(),
+                "{src} should use FFT"
+            );
+            let nyquist = src as f64 / 2.0;
+            for frac in [0.2, 0.5, 0.8, 0.9] {
+                let gain = tone_gain(src, 16000, frac * nyquist);
+                assert!(
+                    gain > 0.98,
+                    "{src} Hz: {:.0} Hz tone kept {gain:.3}",
+                    frac * nyquist
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zero_sample_rate_is_an_error() {
+        assert!(StreamResampler::new(48000, 0).is_err());
+        assert!(StreamResampler::new(0, 16000).is_err());
+    }
+
+    /// Output for a single unit impulse at input index `at` in `len` frames.
+    fn impulse_response(src: usize, dst: usize, len: usize, at: usize) -> Vec<f32> {
+        let mut input = vec![0.0; len];
+        input[at] = 1.0;
+        resample_in_pieces(&input, src, dst, 1000)
+    }
+
+    /// An impulse just before the end of input must come out the same as one
+    /// in the middle, shifted by exactly one second. This checks that the
+    /// flushed tail holds real, aligned output and not padding.
+    #[test]
+    fn flushed_tail_matches_interior() {
+        // FFT downsampling and upsampling, then the sinc fallback.
+        for src in [44100, 48000, 8000, 4000, 44101, 8463] {
+            let dst = 16000;
+            let chunk = match fft_block_sizes(src, dst) {
+                Some((fft_in, _)) => fft_in,
+                None => RESAMPLE_CHUNK_SIZE,
+            };
+            let exact = (3 * src).div_ceil(chunk) * chunk;
+            for len in [exact, exact + 37] {
+                // Leave about 25 output samples after the impulse.
+                let end_at = len - (25 * src).div_ceil(dst) - 1;
+                let mid_at = end_at - src;
+                let mid = impulse_response(src, dst, len, mid_at);
+                let end = impulse_response(src, dst, len, end_at);
+                assert_eq!(end.len(), (len * dst).div_ceil(src));
+                // One second of input is exactly `dst` output samples.
+                let t = mid_at * dst / src;
+                let window = 20;
+                let peak = mid[t - window..=t + window]
+                    .iter()
+                    .fold(0f32, |m, v| m.max(v.abs()));
+                assert!(peak > 0.1, "{src} Hz: impulse missing in the interior");
+                for k in t - window..=t + window {
+                    let (a, b) = (mid[k], end[k + dst]);
+                    assert!(
+                        (a - b).abs() < 1e-3 * peak.max(1.0),
+                        "{src} Hz, len {len}: tail sample {} is {b}, interior gives {a}",
+                        k + dst
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn fft_block_sizes_are_even_and_bounded() {
         for src in [7000, 8000, 11025, 22050, 44100, 48000, 192000] {
             let (fft_in, fft_out) = fft_block_sizes(src, 16000).unwrap();
             assert_eq!(fft_in % 2, 0, "{src}: input block {fft_in}");
             assert_eq!(fft_out % 2, 0, "{src}: output block {fft_out}");
-            assert!(fft_out >= MIN_FFT_OUTPUT_BLOCK);
+            assert!(fft_in >= MIN_FFT_BLOCK && fft_out >= MIN_FFT_BLOCK);
         }
         // No useful common divisor, or an extreme ratio: use sinc instead.
         assert_eq!(fft_block_sizes(44101, 16000), None);
